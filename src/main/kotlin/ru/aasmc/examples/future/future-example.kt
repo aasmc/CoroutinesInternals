@@ -8,9 +8,9 @@ fun bar(v: String): CompletableFuture<String> = CompletableFuture.supplyAsync { 
 fun main() {
     val future = future {
         println("Start")
-        val x = foo().await()
+        val x = foo().awaitCustom()
         println("got $x")
-        val y = bar(x).await()
+        val y = bar(x).awaitCustom()
         println("got $y after $x")
         y
     }

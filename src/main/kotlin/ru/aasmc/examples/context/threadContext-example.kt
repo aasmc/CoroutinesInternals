@@ -1,7 +1,7 @@
 package ru.aasmc.examples.context
 
 import ru.aasmc.examples.delay.delay
-import ru.aasmc.examples.future.await
+import ru.aasmc.examples.future.awaitCustom
 import ru.aasmc.examples.future.future
 import ru.aasmc.examples.util.log
 
@@ -23,7 +23,7 @@ fun main() {
             2
         }
         log("I'll wait for both f1 and f2. It should take just a second!")
-        val sum = f1.await() + f2.await()
+        val sum = f1.awaitCustom() + f2.awaitCustom()
         log("And the sum is $sum")
     }
     f.get()

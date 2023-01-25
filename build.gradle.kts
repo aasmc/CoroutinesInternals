@@ -13,6 +13,9 @@ repositories {
 
 dependencies {
     testImplementation(kotlin("test"))
+    // https://mvnrepository.com/artifact/org.jetbrains.kotlinx/kotlinx-coroutines-jdk8
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.6.4")
+
 }
 
 tasks.test {
