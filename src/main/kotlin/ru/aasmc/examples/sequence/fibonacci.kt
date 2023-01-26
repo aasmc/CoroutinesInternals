@@ -15,5 +15,5 @@ val fibonacci = sequence {
 }
 
 fun main() {
-    println(fibonacci.take(10000).joinToString(separator = ", \n"))
+    println(fibonacci.take(10).joinToString(separator = ", \n"))
 }
