@@ -40,24 +40,123 @@ class Channel<T>(val capacity: Int = 1) : SendChannel<T>, ReceiveChannel<T> {
     private val hasWaiters: Boolean get() = waiters.next != waiters
 
 
-    override suspend fun send(value: T) {
-        TODO("Not yet implemented")
+    override suspend fun send(value: T): Unit = suspendCoroutine sc@{ c ->
+        var receiveWaiter: Waiter<T>? = null
+        locked {
+            check(!closed) { CHANNEL_CLOSED }
+            if (full) { // if reached limit of buffer capacity,
+                // add SendWaiter with this coroutine's continuation and value
+                // it will be resumed when channel has the capacity to accept values
+                addWaiter(SendWaiter(c, value))
+                return@sc
+            } else {
+                // if not full, then we have receive waiters, go grab one
+                receiveWaiter = unlinkFirstWaiter()
+                if (receiveWaiter == null) {
+                    // if no waiters are available, store value on the buffer
+                    buffer.add(value)
+                }
+            }
+        }
+        // if we had a receive waiter, then resume it with value
+        receiveWaiter?.resumeReceive(value)
+        c.resume(Unit) // sent -> resume this coroutine right away
     }
 
     override fun <R> selectSend(a: SendCase<T, R>): Boolean {
-        TODO("Not yet implemented")
+        var receiveWaiter: Waiter<T>? = null
+        locked {
+            if (a.selector.resolved) return true // already resolved selector, do nothing
+            check(!closed) { CHANNEL_CLOSED }
+            if (full) {
+                addWaiter(a)
+                return false // suspended
+            } else {
+                receiveWaiter = unlinkFirstWaiter()
+                if (receiveWaiter == null) {
+                    buffer.add(a.value)
+                }
+            }
+            a.unlink() // was resolved
+        }
+        receiveWaiter?.resumeReceive(a.value)
+        a.resumeSend() // sent -> resume this coroutine right away
+        return true
     }
 
-    override suspend fun receive(): T {
-        TODO("Not yet implemented")
+    @Suppress("UNCHECKED_CAST")
+    override suspend fun receive(): T = suspendCoroutine sc@ { c ->
+        var sendWaiter: Waiter<T>? = null
+        var wasClosed = false
+        var result:T? = null
+        locked {
+            if (empty) {
+                if (closed) {
+                    wasClosed = true
+                } else {
+                    addWaiter(ReceiveWaiter(c))
+                    return@sc // suspended
+                }
+            } else {
+                result = buffer.removeFirst()
+                sendWaiter = unlinkFirstWaiter()
+                if (sendWaiter != null) buffer.add(sendWaiter!!.getSendValue())
+            }
+        }
+        sendWaiter?.resumeSend()
+        if (wasClosed) {
+            c.resumeWithException(NoSuchElementException(CHANNEL_CLOSED))
+        } else {
+            c.resume(result as T)
+        }
     }
 
-    override suspend fun receiveOrNull(): T? {
-        TODO("Not yet implemented")
+    override suspend fun receiveOrNull(): T? = suspendCoroutine sc@ { c ->
+        var sendWaiter: Waiter<T>? = null
+        var result: T? = null
+        locked {
+            if (empty) {
+                if (!closed) {
+                    addWaiter(ReceiveOrNullWaiter(c))
+                    return@sc // suspended
+                }
+            } else {
+                result = buffer.removeFirst()
+                sendWaiter = unlinkFirstWaiter()
+                if (sendWaiter != null) buffer.add(sendWaiter!!.getSendValue())
+            }
+        }
+        sendWaiter?.resumeSend()
+        c.resume(result)
     }
 
     override fun <R> selectReceive(a: ReceiveCase<T, R>): Boolean {
-        TODO("Not yet implemented")
+        var sendWaiter: Waiter<T>? = null
+        var wasClosed = false
+        var result: T? = null
+        locked {
+            if (a.selector.resolved) return true // already resolved selector, do nothing
+            if (empty) {
+                if (closed) {
+                    wasClosed = true
+                } else {
+                    addWaiter(a)
+                    return false // suspended
+                }
+            } else {
+                result = buffer.removeFirst()
+                sendWaiter = unlinkFirstWaiter()
+                if (sendWaiter != null) buffer.add(sendWaiter!!.getSendValue())
+            }
+            a.unlink() // was resolved
+        }
+        sendWaiter?.resumeSend()
+        if (wasClosed)
+            a.resumeClosed()
+        else
+            @Suppress("UNCHECKED_CAST")
+            a.resumeReceive(result as T)
+        return true
     }
 
 
@@ -69,24 +168,37 @@ class Channel<T>(val capacity: Int = 1) : SendChannel<T>, ReceiveChannel<T> {
         private var nextValue: T? = null
 
         override suspend fun hasNext(): Boolean {
+            // fast path
             if (computedNext) return hasNextValue
+            // or else suspend
             return suspendCoroutine sc@{ c ->
                 var sendWaiter: Waiter<T>? = null
                 locked {
                     if (empty) {
                         if (!closed) {
+                            // if empty and not closed, wait for value
+                            // when a value is received, a resumeReceive is called
+                            // IteratorHasNextWaiter will then call setNext on this iterator
+                            // and resume continuation c.resume(true)
+                            // or if channel gets closed the waiter will call setClosed
+                            // on this iterator and resume continuation with exception
                             addWaiter(IteratorHasNextWaiter(c, this))
                             return@sc // suspended
-                        } else {
+                        } else { // channel is closed
                             setClosed()
                         }
                     } else {
+                        // channel is not empty, go get first value from buffer
                         setNext(buffer.removeFirst())
+                        // get first waiter from the intrusive list of waiters
                         sendWaiter = unlinkFirstWaiter()
+                        // add its value to the end of the buffer
                         if (sendWaiter != null) buffer.add(sendWaiter!!.getSendValue())
                     }
                 }
+                // resume the waiter
                 sendWaiter?.resumeSend()
+                // resume current coroutine with hasNext boolean value
                 c.resume(hasNextValue)
             }
         }
@@ -122,7 +234,7 @@ class Channel<T>(val capacity: Int = 1) : SendChannel<T>, ReceiveChannel<T> {
         locked {
             if (closed) return // ignore repeated close
             closed = true
-            if (empty || full) {
+            if (empty || full) { // we may have ReceiveWaiters or SendWaiters or both
                 killList = arrayListOf()
                 while (true) {
                     killList!!.add(unlinkFirstWaiter() ?: break)
@@ -157,17 +269,18 @@ class Channel<T>(val capacity: Int = 1) : SendChannel<T>, ReceiveChannel<T> {
     }
 
     // debugging
-    private val waitersString: String get() {
-        val sb = StringBuilder("[")
-        var w = waiters.next!!
-        while (w != waiters) {
-            if (sb.length > 1) sb.append(", ")
-            sb.append(w)
-            w = w.next!!
+    private val waitersString: String
+        get() {
+            val sb = StringBuilder("[")
+            var w = waiters.next!!
+            while (w != waiters) {
+                if (sb.length > 1) sb.append(", ")
+                sb.append(w)
+                w = w.next!!
+            }
+            sb.append("]")
+            return sb.toString()
         }
-        sb.append("]")
-        return sb.toString()
-    }
 
     override fun toString(): String = locked {
         "Channel #$number closed=$closed, buffer=$buffer, waiters=$waitersString"
@@ -323,46 +436,3 @@ private inline fun <R> locked(block: () -> R): R {
         lock.unlock()
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
